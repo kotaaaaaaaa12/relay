@@ -67,6 +67,7 @@ test('size limits stop an unknown-length source and cancelled jobs cannot finish
 });
 test('API isolates device lists, enforces active quotas, and denies untrusted origins',async()=>{
   const {env,sqlite}=setup();assert.equal((await worker.fetch(request('/api/jobs','POST',{url:'https://files.example.com/a.zip'}),env)).status,201);assert.equal((await worker.fetch(request('/api/jobs','POST',{url:'https://files.example.com/b.zip'}),env)).status,201);assert.equal((await worker.fetch(request('/api/jobs','POST',{url:'https://files.example.com/c.zip'}),env)).status,409);
+  const own=await (await worker.fetch(request('/api/jobs'),env)).json();assert.deepEqual(own.jobs.map(j=>j.url).sort(),['https://files.example.com/a.zip','https://files.example.com/b.zip']);assert.ok(own.jobs.every(j=>!('download_token' in j)));
   const other=await (await worker.fetch(request('/api/jobs','GET',null,'b'.repeat(64)),env)).json();assert.equal(other.jobs.length,0);assert.equal(sqlite.prepare('SELECT COUNT(*) AS count FROM jobs').get().count,2);
   const cross=request('/api/jobs');cross.headers.set('Origin','https://evil.example');assert.equal((await worker.fetch(cross,env)).status,403);
 });

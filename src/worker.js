@@ -3,7 +3,7 @@ import { NonRetryableError } from 'cloudflare:workflows';
 import { RelayError, PART_SIZE, limits, validateURL, safeFetch, filenameFrom, cleanName, parseRange, sha256, token, json, readBody } from './core.js';
 
 const ACTIVE = "'queued','fetching','retrying'";
-const SELECT = 'id,source_host,name,status,received,total,error,created_at,updated_at,expires_at,attempt';
+const SELECT = 'id,url,source_host,name,status,received,total,error,created_at,updated_at,expires_at,attempt';
 const securityHeaders = { 'X-Content-Type-Options':'nosniff', 'Referrer-Policy':'no-referrer',
   'X-Frame-Options':'DENY', 'Permissions-Policy':'camera=(), microphone=(), geolocation=()' };
 
@@ -86,7 +86,7 @@ async function api(request,env) {
   if (path === '/api/health' && request.method === 'GET') {
     try { await env.DB.prepare('SELECT id FROM jobs LIMIT 1').first(); }
     catch { return json({ok:false,error:'Apply the D1 migration to finish setup.',code:'DATABASE_NOT_READY'},503); }
-    return json({ok:true,version:'1.0.0',...limits(env)});
+    return json({ok:true,version:'1.0.2',...limits(env)});
   }
   const file = path.match(/^\/api\/files\/([a-f0-9-]{36})\/([a-f0-9]{64})$/);
   if (file && ['GET','HEAD'].includes(request.method)) return download(request,env,file[1],file[2]);

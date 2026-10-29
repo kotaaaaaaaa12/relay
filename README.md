@@ -38,6 +38,7 @@ Do not use a preview/version-upload command as the production deploy command. Th
 - Byte-range fetching with per-part retries when the source provides ranges and a stable validator.
 - Streaming fallback when range fetching is not available. Retrying this fallback restarts the source stream from the beginning.
 - Download, rename, retry, cancel, search, status filters, and immediate deletion.
+- Open the original URL in a new tab from its source hostname or the file menu.
 - Per-browser private transfer lists, using a random 256-bit device key.
 - Per-file capability URLs, attachment downloads, and resumable single-range downloads.
 - System, light, and dark themes; responsive desktop, tablet, and phone layouts.
