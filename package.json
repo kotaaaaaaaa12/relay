@@ -1,0 +1,17 @@
+{
+  "name": "relay-url-downloader",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "deploy": "wrangler deploy",
+    "test": "node --import ./tests/register.js --test tests/*.test.js",
+    "db:local": "wrangler d1 migrations apply DB --local",
+    "db:remote": "wrangler d1 migrations apply DB --remote",
+    "check": "node scripts/check.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.155.0"
+  }
+}

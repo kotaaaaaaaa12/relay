@@ -1,0 +1,56 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "relay-url-downloader",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": [
+      "/api/*"
+    ]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "relay-db",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "relay-temporary-files"
+    }
+  ],
+  "workflows": [
+    {
+      "binding": "TRANSFERS",
+      "name": "relay-transfers",
+      "class_name": "TransferWorkflow"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "*/10 * * * *"
+    ]
+  },
+  "limits": {
+    "cpu_ms": 300000
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  },
+  "vars": {
+    "MAX_FILE_BYTES": "5368709120",
+    "MAX_STORED_BYTES": "21474836480",
+    "MAX_ACTIVE_PER_DEVICE": "2",
+    "MAX_GLOBAL_ACTIVE": "4",
+    "RETENTION_HOURS": "24",
+    "ALLOWED_ORIGINS": ""
+  },
+  "build": {
+    "command": "node scripts/prepare-database.mjs"
+  }
+}
