@@ -1,6 +1,6 @@
 import { WorkflowEntrypoint } from 'cloudflare:workers';
 import { NonRetryableError } from 'cloudflare:workflows';
-import { RelayError, PART_SIZE, limits, validateURL, safeFetch, filenameFrom, cleanName, parseRange, sha256, token, json, readBody } from './core.js';
+import { RelayError, PART_SIZE, limits, validateURL, safeFetch, filenameFrom, cleanName, parseRange, parseContentRange, sha256, token, json, readBody } from './core.js';
 
 const ACTIVE = "'queued','fetching','retrying'";
 const SELECT = 'id,url,source_host,name,status,received,total,error,created_at,updated_at,expires_at,attempt';
@@ -86,7 +86,7 @@ async function api(request,env) {
   if (path === '/api/health' && request.method === 'GET') {
     try { await env.DB.prepare('SELECT id FROM jobs LIMIT 1').first(); }
     catch { return json({ok:false,error:'Apply the D1 migration to finish setup.',code:'DATABASE_NOT_READY'},503); }
-    return json({ok:true,version:'1.0.2',...limits(env)});
+    return json({ok:true,version:'1.0.3',...limits(env)});
   }
   const file = path.match(/^\/api\/files\/([a-f0-9-]{36})\/([a-f0-9]{64})$/);
   if (file && ['GET','HEAD'].includes(request.method)) return download(request,env,file[1],file[2]);
@@ -178,7 +178,7 @@ function validateSource(r) {
 }
 function totalFromProbe(r) {
   if (r.headers.get('Content-Encoding') && r.headers.get('Content-Encoding') !== 'identity') return null;
-  const raw = r.status === 206 ? /^bytes 0-0\/(\d+)$/.exec(r.headers.get('Content-Range') || '')?.[1] : r.headers.get('Content-Length');
+  const raw = r.status === 206 ? parseContentRange(r.headers.get('Content-Range'))?.total : r.headers.get('Content-Length');
   const n = raw === null || raw === undefined ? null : Number(raw);
   return Number.isSafeInteger(n) && n >= 0 ? n : null;
 }
@@ -187,17 +187,17 @@ async function updateProgress(env,id,received) {
   if (!r.meta.changes) throw new NonRetryableError('This transfer was cancelled.');
 }
 async function trackedBytes(response,env,id,start,maximum,expected = null) {
-  const reader = response.body?.getReader(); if (!reader) return new Uint8Array();
+  const reader = response.body?.getReader(); if (!reader) return expected > 0 ? null : new Uint8Array();
   const chunks = []; let bytes = 0, last = Date.now();
   while (true) {
     let timer; const piece = await Promise.race([reader.read(), new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('The source stopped sending data.')),45000);})]).finally(()=>clearTimeout(timer));
     if (piece.done) break;
     bytes += piece.value.length;
-    if (bytes > maximum || (expected !== null && bytes > expected)) { await reader.cancel(); throw new NonRetryableError('The source exceeded the permitted file size.'); }
+    if (bytes > maximum || (expected !== null && bytes > expected)) { await reader.cancel(); return null; }
     chunks.push(piece.value);
     if (Date.now()-last > 1000) { await updateProgress(env,id,start+bytes); last=Date.now(); }
   }
-  if (expected !== null && bytes !== expected) throw new Error('The source ended before the file was complete.');
+  if (expected !== null && bytes !== expected) return null;
   const out = new Uint8Array(bytes); let offset=0; for (const c of chunks) {out.set(c,offset);offset+=c.length;}
   return out;
 }
@@ -210,10 +210,12 @@ export class TransferWorkflow extends WorkflowEntrypoint {
         const row = await activeJob(env,id); const {response:r,url,controller} = await safeFetch(row.url,{headers:{Range:'bytes=0-0'}});
         try {
           if (r.status === 416 && r.headers.get('Content-Range') === 'bytes */0') return {url,total:0,name:filenameFrom(r.headers,url),range:false,type:'application/octet-stream',validator:null};
+          if ([400,403,405,412,416,501].includes(r.status)) return {url,total:null,name:filenameFrom(r.headers,url),range:false,type:'application/octet-stream',validator:null};
           validateSource(r); const total = totalFromProbe(r);
           if (total !== null && total > config.maxBytes) throw new NonRetryableError('This file exceeds the configured size limit.');
           const etag = r.headers.get('ETag'); const modified = r.headers.get('Last-Modified');
-          return {url,total,name:filenameFrom(r.headers,url),range:r.status===206 && total!==null && Boolean((etag && !etag.startsWith('W/')) || modified),type:r.headers.get('Content-Type') || 'application/octet-stream',validatorKind:(etag && !etag.startsWith('W/')) ? 'etag' : 'modified',validator:(etag && !etag.startsWith('W/')) ? etag : modified};
+          const probe = parseContentRange(r.headers.get('Content-Range'));
+          return {url,total,name:filenameFrom(r.headers,url),range:r.status===206 && probe?.start===0 && probe?.end===0 && total!==null && Boolean((etag && !etag.startsWith('W/')) || modified),type:r.headers.get('Content-Type') || 'application/octet-stream',validatorKind:(etag && !etag.startsWith('W/')) ? 'etag' : 'modified',validator:(etag && !etag.startsWith('W/')) ? etag : modified};
         } finally { controller.abort(); try{await r.body?.cancel();}catch{} }
       });
       await step.do('Prepare storage',async()=>{
@@ -221,36 +223,60 @@ export class TransferWorkflow extends WorkflowEntrypoint {
         const upload = row.upload_id ? env.BUCKET.resumeMultipartUpload(row.object_key,row.upload_id) : await env.BUCKET.createMultipartUpload(row.object_key,{httpMetadata:{contentType:meta.type}});
         await env.DB.prepare(`UPDATE jobs SET status='fetching',total=?,name=?,content_type=?,upload_id=?,updated_at=? WHERE id=? AND status IN (${ACTIVE})`).bind(meta.total,meta.name,meta.type,upload.uploadId,Date.now(),id).run();
       });
-      let parts = [], actualTotal = 0;
+      let parts = [], actualTotal = 0, useStream = !meta.range || meta.total === 0;
       if (meta.range && meta.total > 0) {
         const count = Math.ceil(meta.total/PART_SIZE);
         for (let index=0; index<count; index++) {
           const part = await step.do('Fetch part '+(index+1),{retries:{limit:3,delay:'5 seconds',backoff:'exponential'},timeout:'30 minutes'},async(ctx)=>{
             const row = await activeJob(env,id); const start=index*PART_SIZE; const end=Math.min(meta.total-1,start+PART_SIZE-1);
             await env.DB.prepare(`UPDATE jobs SET status='fetching',attempt=?,received=?,updated_at=? WHERE id=? AND status IN (${ACTIVE})`).bind(ctx.attempt || 1,start,Date.now(),id).run();
-            const {response:r,controller} = await safeFetch(meta.url,{headers:{Range:`bytes=${start}-${end}`,'If-Range':meta.validator}});
+            const {response:r,controller} = await safeFetch(row.url,{headers:{Range:`bytes=${start}-${end}`,'If-Range':meta.validator}});
             try {
-              if (r.status !== 206 || r.headers.get('Content-Range') !== `bytes ${start}-${end}/${meta.total}`) throw new NonRetryableError('The source changed or no longer supports partial downloads. Retry the transfer.');
-              if (r.headers.get('Content-Encoding') && r.headers.get('Content-Encoding') !== 'identity') throw new NonRetryableError('The source returned an unsupported encoded byte range.');
+              // Persist the fallback decision as step output, so Workflow replay follows the same path.
+              if ([200,400,403,405,412,416,501].includes(r.status)) return { fallback:true };
+              validateSource(r);
+              const range = parseContentRange(r.headers.get('Content-Range'));
+              if (r.status !== 206 || !range || range.start !== start || range.end !== end || range.total !== meta.total) return { fallback:true };
+              if (r.headers.get('Content-Encoding') && r.headers.get('Content-Encoding') !== 'identity') return { fallback:true };
               const currentValidator = meta.validatorKind === 'etag' ? r.headers.get('ETag') : r.headers.get('Last-Modified');
-              if (currentValidator !== meta.validator) throw new NonRetryableError('The source file changed during transfer.');
+              if (currentValidator !== meta.validator) return { fallback:true };
               const bytes=await trackedBytes(r,env,id,start,config.maxBytes-start,end-start+1);
+              if (bytes===null) return { fallback:true };
               const upload=env.BUCKET.resumeMultipartUpload(row.object_key,row.upload_id);
               const saved=await upload.uploadPart(index+1,bytes);
               await updateProgress(env,id,end+1); return saved;
             } finally { controller.abort(); try{await r.body?.cancel();}catch{} }
           });
+          if (part.fallback) { useStream=true; break; }
           parts.push(part);
         }
-        actualTotal=meta.total;
-      } else {
+        if (useStream) {
+          await step.do('Restart as a full download',{retries:{limit:3,delay:'5 seconds'},timeout:'2 minutes'},async()=>{
+            const row=await activeJob(env,id);
+            if (row.upload_id) {
+              try { await env.BUCKET.resumeMultipartUpload(row.object_key,row.upload_id).abort(); }
+              catch(e) { if (!/does not exist|not found|NoSuchUpload|10024/i.test(String(e))) throw e; }
+            }
+            const upload=await env.BUCKET.createMultipartUpload(row.object_key);
+            const result=await env.DB.prepare(`UPDATE jobs SET received=0,total=NULL,attempt=0,upload_id=?,updated_at=? WHERE id=? AND status IN (${ACTIVE})`).bind(upload.uploadId,Date.now(),id).run();
+            if (!result.meta.changes) { await upload.abort(); throw new NonRetryableError('This transfer was cancelled.'); }
+          });
+        } else actualTotal=meta.total;
+      }
+      if (useStream) {
         const result=await step.do('Stream source',{retries:{limit:2,delay:'10 seconds',backoff:'exponential'},timeout:'2 hours'},async(ctx)=>{
           const row=await activeJob(env,id);
           await env.DB.prepare(`UPDATE jobs SET received=0,attempt=?,updated_at=? WHERE id=? AND status IN (${ACTIVE})`).bind(ctx.attempt || 1,Date.now(),id).run();
-          const {response:r,controller}=await safeFetch(meta.url);
+          // Resolve redirects again from the original URL, instead of reusing an expired CDN URL.
+          const {response:r,controller}=await safeFetch(row.url);
           let reader;
           try {
             validateSource(r);
+            const responseRange=parseContentRange(r.headers.get('Content-Range'));
+            if ((r.status===206 || r.headers.has('Content-Range')) &&
+                (!responseRange || responseRange.total===null || responseRange.start!==0 || responseRange.end!==responseRange.total-1)) {
+              throw new NonRetryableError('The source returned only part of the file for a full download.');
+            }
             const encoding=r.headers.get('Content-Encoding');
             const raw=r.headers.get('Content-Length'); const n=raw!==null?Number(raw):null; const expected=(!encoding || encoding==='identity') && Number.isSafeInteger(n) && n>=0 ? n : null;
             if (expected!==null && expected>config.maxBytes) throw new NonRetryableError('This file exceeds the configured size limit.');
@@ -269,6 +295,7 @@ export class TransferWorkflow extends WorkflowEntrypoint {
               if(Date.now()-last>1000) {await updateProgress(env,id,total);last=Date.now();}
             }
             if(expected!==null && expected!==total) throw new Error('The source ended before the file was complete.');
+            if(responseRange && responseRange.total!==total) throw new Error('The source ended before the file was complete.');
             if(offset>0) saved.push(await upload.uploadPart(index,buffer.subarray(0,offset)));
             await updateProgress(env,id,total); return {parts:saved,total};
           } finally { controller.abort(); try{await reader?.cancel();}catch{} }

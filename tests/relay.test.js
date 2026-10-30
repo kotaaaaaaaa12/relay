@@ -56,10 +56,10 @@ test('unknown length source is streamed into uniform parts and reports final siz
   const {env,sqlite}=setup(),data=new Uint8Array(PART_SIZE+217).fill(23);globalThis.fetch=source(data,{ranges:false,unknown:true});const row=await add(sqlite);await new TransferWorkflow({},env).run({payload:{id:row.id}},steps());
   assert.equal(sqlite.prepare('SELECT total FROM jobs WHERE id=?').get(row.id).total,data.length);assert.deepEqual(env.BUCKET.objects.get(row.object_key),data);
 });
-test('empty file completes and changed source is rejected without leaking parts',async()=>{
+test('empty file completes and changed range validators trigger a clean full download',async()=>{
   const {env,sqlite}=setup();globalThis.fetch=source(new Uint8Array());const empty=await add(sqlite);await new TransferWorkflow({},env).run({payload:{id:empty.id}},steps());assert.equal(env.BUCKET.objects.get(empty.object_key).length,0);
-  const changed=await add(sqlite);globalThis.fetch=source(new Uint8Array(1024),{change:true});await assert.rejects(()=>new TransferWorkflow({},env).run({payload:{id:changed.id}},steps()),/source file changed/);
-  assert.equal(sqlite.prepare('SELECT status FROM jobs WHERE id=?').get(changed.id).status,'failed');assert.equal(env.BUCKET.uploads.size,0);assert.equal(env.BUCKET.objects.has(changed.object_key),false);
+  const changed=await add(sqlite);const bytes=new Uint8Array(1024).fill(19);globalThis.fetch=source(bytes,{change:true});await new TransferWorkflow({},env).run({payload:{id:changed.id}},steps());
+  assert.equal(sqlite.prepare('SELECT status FROM jobs WHERE id=?').get(changed.id).status,'completed');assert.equal(env.BUCKET.uploads.size,0);assert.deepEqual(env.BUCKET.objects.get(changed.object_key),bytes);
 });
 test('size limits stop an unknown-length source and cancelled jobs cannot finish',async()=>{
   const {env,sqlite}=setup();env.MAX_FILE_BYTES='100';globalThis.fetch=source(new Uint8Array(150),{ranges:false,unknown:true});const row=await add(sqlite);await assert.rejects(()=>new TransferWorkflow({},env).run({payload:{id:row.id}},steps()),/size limit/);assert.equal(env.BUCKET.uploads.size,0);
@@ -80,4 +80,82 @@ test('downloads use a per-file capability, support ranges, and expire before cle
 test('cleanup is not starved by already cleaned terminal rows',async()=>{
   const {env,sqlite}=setup(),now=Date.now();for(let i=0;i<105;i++)await add(sqlite,{status:'cancelled',cleaned_at:now,created_at:now-86400000});
   const expired=await add(sqlite,{status:'completed',total:1,received:1,expires_at:now-1});await env.BUCKET.put(expired.object_key,new Uint8Array([5]));let task;await worker.scheduled({},env,{waitUntil(p){task=p;}});await task;assert.equal(env.BUCKET.objects.has(expired.object_key),false);assert.equal(sqlite.prepare('SELECT status FROM jobs WHERE id=?').get(expired.id).status,'expired');
+});
+
+test('range fallback discards saved parts and downloads one complete replacement without mixing versions',async()=>{
+  const {env,sqlite}=setup(),oldBytes=new Uint8Array(PART_SIZE+31).fill(7),newBytes=new Uint8Array(211).fill(29);
+  const ranged=source(oldBytes),full=source(newBytes,{ranges:false});let fullRequests=0,ignored=0;
+  globalThis.fetch=async(input,init={})=>{
+    if(String(input).includes('dns-query'))return ranged(input,init);
+    if(!init.headers?.Range){fullRequests++;return full(input,init);}
+    if(init.headers.Range.startsWith(`bytes=${PART_SIZE}-`)){ignored++;return full(input,init);}
+    return ranged(input,init);
+  };
+  const row=await add(sqlite);const journal=new Map();
+  const replayable={async do(name,options,fn){if(journal.has(name))return journal.get(name);const result=await steps().do(name,options,fn);journal.set(name,result);return result;}};
+  await new TransferWorkflow({},env).run({payload:{id:row.id}},replayable);
+  assert.equal(ignored,1);assert.equal(fullRequests,1);assert.equal(journal.has('Restart as a full download'),true);
+  assert.deepEqual(env.BUCKET.objects.get(row.object_key),newBytes);assert.equal(env.BUCKET.uploads.size,0);
+  const saved=sqlite.prepare('SELECT * FROM jobs WHERE id=?').get(row.id);assert.equal(saved.status,'completed');assert.equal(saved.total,newBytes.length);assert.equal(saved.received,newBytes.length);
+  await new TransferWorkflow({},env).run({payload:{id:row.id}},replayable);
+  assert.equal(fullRequests,1);assert.deepEqual(env.BUCKET.objects.get(row.object_key),newBytes);
+});
+
+test('incompatible range responses automatically fall back to a full request',async()=>{
+  for(const kind of ['wrong-range','missing-validator','range-refused','encoded-range','short-body','long-body']){
+    const {env,sqlite}=setup(),data=new Uint8Array(1024).fill(41),normal=source(data);let fullRequests=0;
+    globalThis.fetch=async(input,init={})=>{
+      if(String(input).includes('dns-query'))return normal(input,init);
+      if(!init.headers?.Range){fullRequests++;return normal(input,init);}
+      if(init.headers.Range==='bytes=0-0')return normal(input,init);
+      if(kind==='range-refused')return new Response(null,{status:416,headers:{'Content-Range':'bytes */1024'}});
+      const r=await normal(input,init),headers=new Headers(r.headers);
+      if(kind==='short-body'||kind==='long-body')return new Response(new Uint8Array(kind==='short-body'?3:2048),{status:206,headers});
+      if(kind==='wrong-range')headers.set('Content-Range','bytes 0-7/1024');
+      if(kind==='missing-validator')headers.delete('ETag');
+      if(kind==='encoded-range')headers.set('Content-Encoding','gzip');
+      return new Response(r.body,{status:r.status,headers});
+    };
+    const row=await add(sqlite);await new TransferWorkflow({},env).run({payload:{id:row.id}},steps());
+    assert.equal(fullRequests,1,kind);assert.deepEqual(env.BUCKET.objects.get(row.object_key),data,kind);assert.equal(env.BUCKET.uploads.size,0,kind);
+  }
+});
+
+test('range header formatting is parsed semantically without restarting a valid transfer',async()=>{
+  const {env,sqlite}=setup(),data=new Uint8Array(127).fill(3),normal=source(data);let fullRequests=0;
+  globalThis.fetch=async(input,init={})=>{
+    if(!String(input).includes('dns-query')&&!init.headers?.Range)fullRequests++;
+    const r=await normal(input,init);if(r.status!==206)return r;
+    const headers=new Headers(r.headers);headers.set('Content-Range',headers.get('Content-Range').replace('bytes ','BYTES  ').replace('/',' / '));
+    return new Response(r.body,{status:206,headers});
+  };
+  const row=await add(sqlite);await new TransferWorkflow({},env).run({payload:{id:row.id}},steps());assert.equal(fullRequests,0);assert.deepEqual(env.BUCKET.objects.get(row.object_key),data);
+});
+
+test('a source that rejects the range probe can still be fetched normally',async()=>{
+  const {env,sqlite}=setup(),data=new Uint8Array(83).fill(11),normal=source(data);
+  globalThis.fetch=async(input,init={})=>!String(input).includes('dns-query')&&init.headers?.Range?new Response(null,{status:403}):normal(input,init);
+  const row=await add(sqlite);await new TransferWorkflow({},env).run({payload:{id:row.id}},steps());assert.deepEqual(env.BUCKET.objects.get(row.object_key),data);
+});
+
+test('a full-download response must not silently save a partial file',async()=>{
+  const {env,sqlite}=setup(),data=new Uint8Array(1024).fill(17),normal=source(data);
+  globalThis.fetch=async(input,init={})=>{
+    if(String(input).includes('dns-query'))return normal(input,init);
+    if(init.headers?.Range)return normal(input,{...init,headers:{...init.headers,Range:'bytes=0-0'}});
+    return new Response(data.slice(0,10),{status:206,headers:{'Content-Type':'application/zip','Content-Length':'10','Content-Range':'bytes 0-9/1024'}});
+  };
+  const row=await add(sqlite);await assert.rejects(()=>new TransferWorkflow({},env).run({payload:{id:row.id}},steps()),/only part of the file/);
+  assert.equal(sqlite.prepare('SELECT status FROM jobs WHERE id=?').get(row.id).status,'failed');assert.equal(env.BUCKET.objects.has(row.object_key),false);assert.equal(env.BUCKET.uploads.size,0);
+});
+
+test('each source request resolves redirects again instead of reusing an expired CDN location',async()=>{
+  const {env,sqlite}=setup(),data=new Uint8Array(143).fill(31),normal=source(data);let redirects=0;const targets=[];
+  globalThis.fetch=async(input,init={})=>{
+    const u=new URL(String(input));if(u.hostname==='cloudflare-dns.com')return normal(input,init);
+    if(u.hostname==='files.example.com'){redirects++;return new Response(null,{status:302,headers:{Location:`https://cdn.example.com/file-${redirects}.zip`}});}
+    targets.push(u.pathname);if(targets.filter(path=>path===u.pathname).length>1)return new Response(null,{status:403});
+    return normal(input,init);
+  };
+  const row=await add(sqlite);await new TransferWorkflow({},env).run({payload:{id:row.id}},steps());assert.deepEqual(targets,['/file-1.zip','/file-2.zip']);assert.deepEqual(env.BUCKET.objects.get(row.object_key),data);
 });

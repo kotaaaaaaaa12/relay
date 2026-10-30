@@ -36,7 +36,7 @@ Do not use a preview/version-upload command as the production deploy command. Th
 - Independent background Workflows: closing the page does not stop the server transfer.
 - Bounded 8 MiB multipart buffers, rather than buffering the whole file in memory.
 - Byte-range fetching with per-part retries when the source provides ranges and a stable validator.
-- Streaming fallback when range fetching is not available. Retrying this fallback restarts the source stream from the beginning.
+- Automatic streaming fallback when range requests are ignored, rejected, encoded, or inconsistent. Previously uploaded parts are discarded before restarting a full source request. Retrying the full download restarts it from the beginning.
 - Download, rename, retry, cancel, search, status filters, and immediate deletion.
 - Open the original URL in a new tab from its source hostname or the file menu.
 - Per-browser private transfer lists, using a random 256-bit device key.
@@ -73,7 +73,7 @@ For larger configured files, review R2 multipart limits, Workflows step and subr
 
 Public direct HTTP and HTTPS file URLs, including ordinary redirects and signed download URLs. Source credentials, custom headers, cookies, CAPTCHA solving, and video watch-page extraction are not supported. Sources can reject data-center requests or require authentication; those failures are shown in the transfer list.
 
-HTML responses are rejected with a direct-file explanation to avoid saving a login or error page as the requested file. When a source changes its validator mid-transfer, Relay stops rather than combining bytes from different versions.
+HTML responses are rejected with a direct-file explanation to avoid saving a login or error page as the requested file. When a source changes its validator or returns inconsistent byte ranges, Relay discards the partial upload and starts a fresh full download. Bytes from different versions are never combined. Each request resolves redirects again from the original URL, so it does not depend on reusing a temporary CDN location.
 
 ## Access and storage
 
@@ -102,7 +102,7 @@ npm run check
 
 ## Validation
 
-The included integration tests use SQLite with the actual schema and a deterministic R2/Workflows test adapter. They cover exact multipart bytes, sources without a total size, empty files, source changes, size limits, cancellation, device isolation, admission limits, byte ranges, expiry, redirect validation, and cleanup starvation. The Worker also passes Wrangler's dry-run bundling check.
+The included integration tests use SQLite with the actual schema and a deterministic R2/Workflows test adapter. They cover exact multipart bytes, sources without a total size, empty files, source changes, size limits, cancellation, device isolation, admission limits, byte ranges, expiry, redirect validation, and cleanup starvation. Regression cases also cover range-to-full fallback after saved parts, missing validators, inconsistent ranges, changed source data, fresh redirect resolution, and rejecting incomplete full-download responses. The Worker also passes Wrangler's dry-run bundling check.
 
 A real deployment still needs a Cloudflare account with the resources and permissions above. A live multi-gigabyte transfer has not been exercised against your account.
 
@@ -112,3 +112,7 @@ A real deployment still needs a Cloudflare account with the resources and permis
 - [Wrangler custom build hooks](https://developers.cloudflare.com/workers/wrangler/custom-builds/)
 - [R2 multipart uploads](https://developers.cloudflare.com/r2/objects/upload-objects/)
 - [Workflows limits](https://developers.cloudflare.com/workflows/reference/limits/)
+
+## Updating to 1.0.3
+
+Deploy this cumulative package with the same Worker and storage names. No database migration is added. After deploying, use **Retry** on transfers that already failed with the partial-download error; Retry creates a fresh Workflow instance that uses the corrected download logic. The automatic fallback may reset received bytes to zero because a full download restarts from the beginning.

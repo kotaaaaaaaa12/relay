@@ -105,6 +105,14 @@ export function parseRange(header, size) {
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= size || end < start) throw new RelayError('Invalid byte range.',416);
   return { offset: start, length: end-start+1 };
 }
+export function parseContentRange(value) {
+  const match = /^\s*bytes\s+(\d+)\s*-\s*(\d+)\s*\/\s*(\d+|\*)\s*$/i.exec(value || '');
+  if (!match) return null;
+  const start = Number(match[1]), end = Number(match[2]), total = match[3] === '*' ? null : Number(match[3]);
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end < start ||
+      (total !== null && (!Number.isSafeInteger(total) || total <= end))) return null;
+  return { start, end, total };
+}
 export async function sha256(value) {
   const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
   return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2,'0')).join('');
